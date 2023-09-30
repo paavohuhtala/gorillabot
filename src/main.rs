@@ -1,34 +1,31 @@
 use std::env;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use a2s::info::Info;
 use a2s::A2SClient;
 use anyhow::{self, Context as AnyhowContext};
+use chrono::{DateTime, Local};
 use dotenv::dotenv;
 use serenity::async_trait;
 use serenity::framework::standard::macros::{command, group};
 use serenity::framework::standard::{Args, CommandResult};
 use serenity::framework::StandardFramework;
-use serenity::model::prelude::{ChannelId, GuildId, Message, MessageId};
+use serenity::model::prelude::{GuildId, Message};
 use serenity::prelude::*;
-use sled::Tree;
+
+mod db;
+mod types;
+
+use db::BotDb;
+
+use crate::types::Subscription;
 
 #[derive(Debug)]
 struct Config {
     discord_token: String,
-    discord_channel_id: ChannelId,
-    discord_message_id: MessageId,
-
     poll_interval: tokio::time::Duration,
-    server_hostname: SocketAddr,
-}
-
-#[derive(Debug)]
-struct Subscription {
-    channel_id: ChannelId,
-    message_id: MessageId,
-    server_hostname: SocketAddr,
 }
 
 struct Handler {
@@ -38,8 +35,8 @@ struct Handler {
 }
 
 impl Handler {
-    fn new(config: Arc<Config>) -> Self {
-        let arma_client = A2SClient::new().expect("Failed to create A2S client");
+    async fn new(config: Arc<Config>) -> Self {
+        let arma_client = A2SClient::new().await.expect("Failed to create A2S client");
 
         Self {
             is_loop_running: AtomicBool::new(false),
@@ -51,10 +48,17 @@ impl Handler {
 
 #[group]
 #[commands(follow_server, unfollow_server)]
-struct General;
+#[allowed_roles("GorillaBot Admin")]
+#[owner_privilege(false)]
+struct AdminOnly;
 
 #[command]
 async fn follow_server(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+    log::info!(
+        "Received follow_server command in channel {}",
+        msg.channel_id
+    );
+
     if args.is_empty() {
         msg.reply(ctx, "Expected server hostname").await?;
         return CommandResult::Ok(());
@@ -62,28 +66,44 @@ async fn follow_server(ctx: &Context, msg: &Message, mut args: Args) -> CommandR
 
     let server_hostname = args.trimmed().current().unwrap();
 
-    let data = ctx.data.read().await;
-    let db = data.get::<BotDb>().unwrap();
+    log::info!("Parsing & resolving server hostname: {}", server_hostname);
+
+    match server_hostname.to_socket_addrs() {
+        Ok(mut server_hostnames) => {
+            match server_hostnames.next() {
+                Some(_) => {}
+                None => {
+                    log::warn!("Failed to resolve server address: {}", server_hostname);
+                    msg.reply(ctx, "Failed to resolve server address").await?;
+                    return CommandResult::Ok(());
+                }
+            };
+        }
+        Err(_) => {
+            log::warn!("Invalid server hostname: {}", server_hostname);
+            msg.reply(ctx, "Invalid server hostname").await?;
+            return CommandResult::Ok(());
+        }
+    };
 
     let message = msg
         .channel_id
         .send_message(&ctx, |m| {
-            m.embed(|e| {
-                e.title("Server status")
-                    .field("Server name", "Unknown", false)
-                    .field("Server address", server_hostname, false)
-                    .field("Map", "Unknown", false)
-                    .field("Players", "Unknown", false)
-            })
+            m.embed(get_server_status_setter(None, server_hostname))
         })
         .await?;
 
-    db.set_channel_subscription(
-        msg.guild_id.unwrap(),
-        msg.channel_id,
-        message.id,
-        server_hostname,
-    )?;
+    let data = ctx.data.read().await;
+    let db = data.get::<BotDb>().unwrap().clone();
+
+    db.upsert_subscription(Subscription {
+        id: None,
+        guild_id: msg.guild_id.unwrap(),
+        channel_id: msg.channel_id,
+        message_id: message.id,
+        server_hostname: server_hostname.to_string(),
+    })
+    .await?;
 
     msg.react(ctx, '👍').await?;
 
@@ -91,16 +111,108 @@ async fn follow_server(ctx: &Context, msg: &Message, mut args: Args) -> CommandR
 }
 
 #[command]
-async fn unfollow_server(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+async fn unfollow_server(ctx: &Context, msg: &Message) -> CommandResult {
     let data = ctx.data.read().await;
     let db = data.get::<BotDb>().unwrap();
 
-    db.remove_channel_subscription(msg.guild_id.unwrap())?;
+    db.delete_subscriptions_by_channel_id(msg.channel_id)
+        .await?;
 
     msg.reply(ctx, "Unsubscribed from server status updates :(")
         .await?;
 
     CommandResult::Ok(())
+}
+
+fn get_server_status_setter<'a>(
+    info: Option<&'a Info>,
+    address: &'a str,
+) -> impl FnOnce(&mut serenity::builder::CreateEmbed) -> &mut serenity::builder::CreateEmbed + 'a {
+    let now: DateTime<Local> = Local::now();
+    let updated_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
+
+    move |embed| match info {
+        Some(info) => embed
+            .field("Server name", info.name.clone(), false)
+            .field("Server address", address, false)
+            .field("Map", info.map.clone(), false)
+            .field("Players", info.players, false)
+            .field("Updated at", updated_at, false),
+        None => embed
+            .field("Server name", "Unknown", false)
+            .field("Server address", address, false)
+            .field("Map", "Unknown", false)
+            .field("Players", "Unknown", false)
+            .field("Updated at", updated_at, false),
+    }
+}
+
+fn is_message_was_removed_error(err: &SerenityError) -> bool {
+    match err {
+        SerenityError::Http(http_error) => match http_error.as_ref() {
+            HttpError::UnsuccessfulRequest(res) => res.error.message == "Unknown Message",
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+async fn handle_subscription(
+    ctx: &Context,
+    db: &BotDb,
+    arma_client: &A2SClient,
+    subscription: Subscription,
+) -> anyhow::Result<()> {
+    let info = arma_client
+        .info(subscription.server_hostname.as_str())
+        .await;
+
+    match info.as_ref() {
+        Err(err) => {
+            log::warn!(
+                "Failed to get server info for {}: {:?}",
+                subscription.server_hostname,
+                err
+            );
+        }
+        Ok(info) => {
+            log::info!(
+                "Got server info for {}: {:?}",
+                subscription.server_hostname,
+                info
+            );
+        }
+    }
+
+    let info = info.ok();
+
+    let status_setter =
+        get_server_status_setter(info.as_ref(), subscription.server_hostname.as_ref());
+
+    let update_message_result = subscription
+        .channel_id
+        .edit_message(&ctx, subscription.message_id, |m| m.embed(status_setter))
+        .await;
+
+    match update_message_result {
+        Ok(_) => {}
+        Err(err) if is_message_was_removed_error(&err) => {
+            log::warn!("Failed to update message on channel {} because it was removed, removing subscription", subscription.channel_id);
+
+            db.delete_subscription_by_id(
+                subscription
+                    .id
+                    .expect("Subscription from database should always have an ID"),
+            )
+            .await
+            .unwrap();
+        }
+        Err(err) => {
+            log::error!("Failed to update message: {:?}", err);
+        }
+    }
+
+    Ok(())
 }
 
 #[async_trait]
@@ -112,31 +224,18 @@ impl EventHandler for Handler {
 
         let db = {
             let data = ctx.data.read().await;
-            data.get::<BotDb>().unwrap().clone()
+            data.get::<BotDb>().cloned().unwrap()
         };
 
         if !self.is_loop_running.load(Ordering::Relaxed) {
             tokio::spawn(async move {
                 loop {
-                    let guilds = db.get_guilds().expect("Failed to get guilds from DB");
-                    println!("Guilds: {:?}", guilds);
+                    let subscriptions = db.get_subscriptions().await.unwrap();
 
-                    let info = arma_client.info(&config.server_hostname).unwrap();
-                    println!("{:#?}", info);
-
-                    if let Err(err) = config
-                        .discord_channel_id
-                        .edit_message(&ctx, config.discord_message_id, |m| {
-                            m.embed(|e| {
-                                e.title("Server status")
-                                    .field("Server name", info.name, false)
-                                    .field("Map", info.map, false)
-                                    .field("Players", info.players, false)
-                            })
-                        })
-                        .await
-                    {
-                        log::error!("Failed to send message: {:?}", err);
+                    for subscription in subscriptions {
+                        handle_subscription(&ctx, &db, &arma_client, subscription)
+                            .await
+                            .unwrap();
                     }
 
                     tokio::time::sleep(config.poll_interval).await;
@@ -151,163 +250,47 @@ fn get_config_from_env() -> anyhow::Result<Config> {
         .context("Expected GORILLA_ARMA_POLL_INTERVAL_SECONDS env var")?
         .parse::<u64>()
         .context("Invalid poll interval")?;
-    let server_hostname = env::var("GORILLA_ARMA_HOSTNAME")
-        .context("Expected GORILLA_ARMA_HOSTNAME env var")?
-        .to_socket_addrs()?
-        .next()
-        .context("Invalid server hostname")?;
 
     let token =
         env::var("GORILLA_DISCORD_TOKEN").context("Expected GORILLA_DISCORD_TOKEN env var")?;
 
-    let discord_channel_id = env::var("GORILLA_DISCORD_CHANNEL_ID")
-        .context("Expected GORILLA_DISCORD_CHANNEL_ID env var")?
-        .parse::<u64>()
-        .context("Invalid channel id")?
-        .into();
-
-    let discord_message_id = env::var("GORILLA_DISCORD_MESSAGE_ID")
-        .context("Expected GORILLA_DISCORD_MESSAGE_ID env var")?
-        .parse::<u64>()
-        .context("Invalid message id")?
-        .into();
-
     Ok(Config {
         poll_interval: tokio::time::Duration::from_secs(poll_interval),
-        server_hostname,
         discord_token: token,
-        discord_channel_id,
-        discord_message_id,
     })
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv()?;
+    dotenv().ok();
     pretty_env_logger::init();
 
-    let db = sled::open("gorillabot.sled").expect("Failed to open sled db");
+    log::info!("Loading gorillabot.db");
+
+    let db = BotDb::new("gorillabot.db");
+
+    log::info!("Migrating database");
+
+    db.migrate().await?;
+
+    log::info!("Creating Discord client");
 
     let config = get_config_from_env()?;
-
     let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
-
     let framework = StandardFramework::new()
         .configure(|c| c.prefix("!"))
-        .group(&GENERAL_GROUP);
+        .group(&ADMINONLY_GROUP);
 
     let mut client = Client::builder(config.discord_token.clone(), intents)
-        .event_handler(Handler::new(Arc::new(config)))
+        .event_handler(Handler::new(Arc::new(config)).await)
         .framework(framework)
         .await?;
 
-    client
-        .data
-        .write()
-        .await
-        .insert::<BotDb>(BotDb(Arc::new(db)));
+    client.data.write().await.insert::<BotDb>(db);
 
     if let Err(why) = client.start().await {
-        println!("An error occurred while running the client: {:?}", why);
+        log::error!("An error occurred while running the client: {:?}", why);
     }
 
     Ok(())
-}
-
-#[derive(Clone)]
-struct BotDb(Arc<sled::Db>);
-
-impl TypeMapKey for BotDb {
-    type Value = BotDb;
-}
-
-impl BotDb {
-    const CHANNEL_ID_KEY: &'static str = "channel_id";
-    const SERVER_HOSTNAME_KEY: &'static str = "server_hostname";
-    const MESSAGE_ID_KEY: &'static str = "message_id";
-
-    fn get_guild_tree(&self, guild_id: GuildId) -> anyhow::Result<Tree> {
-        let tree = self.0.open_tree(guild_id.to_string()).with_context(|| {
-            format!("Failed to get or create DB keyspace for guild id {guild_id}")
-        })?;
-
-        Ok(tree)
-    }
-
-    fn set_channel_subscription(
-        &self,
-        guild_id: GuildId,
-        channel_id: ChannelId,
-        message_id: MessageId,
-        server_hostname: &str,
-    ) -> anyhow::Result<()> {
-        let tree = self.get_guild_tree(guild_id)?;
-        let channel_id = channel_id.0.to_string();
-        let message_id = message_id.0.to_string();
-
-        tree.insert(Self::CHANNEL_ID_KEY, channel_id.as_str())?;
-        tree.insert(Self::SERVER_HOSTNAME_KEY, server_hostname)?;
-        tree.insert(Self::MESSAGE_ID_KEY, message_id.as_str())?;
-
-        Ok(())
-    }
-
-    fn remove_channel_subscription(&self, guild_id: GuildId) -> anyhow::Result<()> {
-        let tree = self.get_guild_tree(guild_id)?;
-
-        tree.remove(Self::CHANNEL_ID_KEY)?;
-        tree.remove(Self::SERVER_HOSTNAME_KEY)?;
-        tree.remove(Self::MESSAGE_ID_KEY)?;
-
-        Ok(())
-    }
-
-    fn get_channel_subscription(&self, guild_id: GuildId) -> anyhow::Result<Option<Subscription>> {
-        let tree = self.get_guild_tree(guild_id)?;
-
-        let channel_id = tree.get(Self::CHANNEL_ID_KEY)?.map(|v| {
-            String::from_utf8(v.to_vec())
-                .expect("Failed to parse channel id from DB")
-                .parse::<u64>()
-                .expect("Failed to parse channel id from DB")
-                .into()
-        });
-
-        let message_id = tree.get(Self::MESSAGE_ID_KEY)?.map(|v| {
-            String::from_utf8(v.to_vec())
-                .expect("Failed to parse message id from DB")
-                .parse::<u64>()
-                .expect("Failed to parse message id from DB")
-                .into()
-        });
-
-        let server_hostname = tree.get(Self::SERVER_HOSTNAME_KEY)?.map(|v| {
-            String::from_utf8(v.to_vec())
-                .expect("Failed to parse server hostname from DB")
-                .parse::<SocketAddr>()
-                .expect("Failed to parse server hostname from DB")
-        });
-
-        Ok(match (channel_id, message_id, server_hostname) {
-            (Some(channel_id), Some(message_id), Some(server_hostname)) => Some(Subscription {
-                channel_id,
-                message_id,
-                server_hostname,
-            }),
-            _ => None,
-        })
-    }
-
-    fn get_guilds(&self) -> anyhow::Result<Vec<GuildId>> {
-        let mut guilds = Vec::new();
-
-        for guild_id in self.0.tree_names() {
-            println!("Guild id: {:?}", guild_id);
-            let id_str = String::from_utf8(guild_id.to_vec())?;
-            println!("Guild id str: {:?}", id_str);
-            guilds.push(GuildId(id_str.parse::<u64>()?));
-        }
-
-        Ok(guilds)
-    }
 }

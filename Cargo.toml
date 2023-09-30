@@ -6,13 +6,17 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-a2s = "0.5.2"
+a2s = { version = "0.5.2", features = ["async"] }
 anyhow = "1.0.75"
+chrono = "0.4.31"
 dotenv = "0.15.0"
 log = "0.4.20"
 pretty_env_logger = "0.5.0"
-sled = "0.34.7"
 tokio = { version = "1.32.0", features = ["macros", "rt-multi-thread"] }
 
 [dependencies.serenity]
 version = "0.11"
+
+[dependencies.rusqlite]
+version = "0.29.0"
+features = ["bundled"]
