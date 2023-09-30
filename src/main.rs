@@ -19,29 +19,30 @@ mod db;
 mod types;
 
 use db::BotDb;
+use tokio::time::Duration;
 
 use crate::types::Subscription;
 
 #[derive(Debug)]
 struct Config {
     discord_token: String,
-    poll_interval: tokio::time::Duration,
+    poll_interval: Duration,
 }
 
 struct Handler {
     is_loop_running: AtomicBool,
     config: Arc<Config>,
-    arma_client: Arc<A2SClient>,
+    a2s_client: Arc<A2SClient>,
 }
 
 impl Handler {
     async fn new(config: Arc<Config>) -> Self {
-        let arma_client = A2SClient::new().await.expect("Failed to create A2S client");
+        let a2s_client = A2SClient::new().await.expect("Failed to create A2S client");
 
         Self {
             is_loop_running: AtomicBool::new(false),
             config,
-            arma_client: Arc::new(arma_client),
+            a2s_client: Arc::new(a2s_client),
         }
     }
 }
@@ -160,12 +161,10 @@ fn is_message_was_removed_error(err: &SerenityError) -> bool {
 async fn handle_subscription(
     ctx: &Context,
     db: &BotDb,
-    arma_client: &A2SClient,
+    a2s_client: &A2SClient,
     subscription: Subscription,
 ) -> anyhow::Result<()> {
-    let info = arma_client
-        .info(subscription.server_hostname.as_str())
-        .await;
+    let info = a2s_client.info(subscription.server_hostname.as_str()).await;
 
     match info.as_ref() {
         Err(err) => {
@@ -219,7 +218,7 @@ async fn handle_subscription(
 impl EventHandler for Handler {
     async fn cache_ready(&self, ctx: Context, _guilds: Vec<GuildId>) {
         let ctx: Context = ctx.clone();
-        let arma_client = self.arma_client.clone();
+        let a2s_client = self.a2s_client.clone();
         let config = self.config.clone();
 
         let db = {
@@ -233,7 +232,7 @@ impl EventHandler for Handler {
                     let subscriptions = db.get_subscriptions().await.unwrap();
 
                     for subscription in subscriptions {
-                        handle_subscription(&ctx, &db, &arma_client, subscription)
+                        handle_subscription(&ctx, &db, &a2s_client, subscription)
                             .await
                             .unwrap();
                     }
@@ -246,16 +245,18 @@ impl EventHandler for Handler {
 }
 
 fn get_config_from_env() -> anyhow::Result<Config> {
-    let poll_interval = env::var("GORILLA_ARMA_POLL_INTERVAL_SECONDS")
-        .context("Expected GORILLA_ARMA_POLL_INTERVAL_SECONDS env var")?
-        .parse::<u64>()
-        .context("Invalid poll interval")?;
+    let poll_interval = if let Ok(key) = env::var("GORILLA_POLL_INTERVAL_SECONDS") {
+        key.parse::<u64>()
+            .context("Failed to parse GORILLA_POLL_INTERVAL_SECONDS env var")?
+    } else {
+        30
+    };
 
     let token =
         env::var("GORILLA_DISCORD_TOKEN").context("Expected GORILLA_DISCORD_TOKEN env var")?;
 
     Ok(Config {
-        poll_interval: tokio::time::Duration::from_secs(poll_interval),
+        poll_interval: Duration::from_secs(poll_interval),
         discord_token: token,
     })
 }
