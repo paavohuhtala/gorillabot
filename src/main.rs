@@ -48,7 +48,7 @@ impl Handler {
 
 #[group]
 #[commands(follow_server, unfollow_server)]
-#[allowed_roles("GorillaBot Admin")]
+#[allowed_roles("gorilladmin")]
 #[owner_privilege(false)]
 struct AdminOnly;
 
