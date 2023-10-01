@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use a2s::info::Info;
+use a2s::players::Player;
 use a2s::A2SClient;
 use anyhow::{self, Context as AnyhowContext};
 use chrono::{DateTime, Local};
@@ -126,24 +127,39 @@ async fn unfollow_server(ctx: &Context, msg: &Message) -> CommandResult {
 }
 
 fn get_server_status_setter<'a>(
-    info: Option<&'a Info>,
+    info: Option<(Info, Vec<Player>)>,
     address: &'a str,
 ) -> impl FnOnce(&mut serenity::builder::CreateEmbed) -> &mut serenity::builder::CreateEmbed + 'a {
     let now: DateTime<Local> = Local::now();
     let updated_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
 
     move |embed| match info {
-        Some(info) => embed
-            .field("Server name", info.name.clone(), false)
-            .field("Server address", address, false)
-            .field("Map", info.map.clone(), false)
-            .field("Players", info.players, false)
-            .field("Updated at", updated_at, false),
+        Some((info, players)) => {
+            let embed = embed
+                .field("Server name", info.name.clone(), false)
+                .field("Server address", address, false)
+                .field("Map", info.map.clone(), false)
+                .field("Player count", info.players, false);
+
+            let embed = if players.len() > 0 {
+                let players = players
+                    .into_iter()
+                    .map(|player| player.name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                embed.field("Players", players, false)
+            } else {
+                embed
+            };
+
+            embed.field("Updated at", updated_at, false)
+        }
         None => embed
             .field("Server name", "Unknown", false)
             .field("Server address", address, false)
             .field("Map", "Unknown", false)
-            .field("Players", "Unknown", false)
+            .field("Player count", "Unknown", false)
             .field("Updated at", updated_at, false),
     }
 }
@@ -166,27 +182,55 @@ async fn handle_subscription(
 ) -> anyhow::Result<()> {
     let info = a2s_client.info(subscription.server_hostname.as_str()).await;
 
-    match info.as_ref() {
-        Err(err) => {
-            log::warn!(
-                "Failed to get server info for {}: {:?}",
-                subscription.server_hostname,
-                err
-            );
-        }
+    let info = match info {
         Ok(info) => {
             log::info!(
                 "Got server info for {}: {:?}",
                 subscription.server_hostname,
                 info
             );
+
+            // If there are any players, get them too
+            if info.players > 0 {
+                let players = a2s_client
+                    .players(subscription.server_hostname.as_str())
+                    .await;
+
+                match players {
+                    Err(err) => {
+                        log::warn!(
+                            "Failed to get server players for {}: {:?}",
+                            subscription.server_hostname,
+                            err
+                        );
+                        Some((info, Vec::new()))
+                    }
+                    Ok(players) => {
+                        log::info!(
+                            "Got server players for {}: {:?}",
+                            subscription.server_hostname,
+                            players
+                        );
+                        Some((info, players))
+                    }
+                }
+            } else {
+                Some((info, Vec::new()))
+            }
         }
-    }
 
-    let info = info.ok();
+        Err(err) => {
+            log::warn!(
+                "Failed to get server info for {}: {:?}",
+                subscription.server_hostname,
+                err
+            );
 
-    let status_setter =
-        get_server_status_setter(info.as_ref(), subscription.server_hostname.as_ref());
+            None
+        }
+    };
+
+    let status_setter = get_server_status_setter(info, subscription.server_hostname.as_ref());
 
     let update_message_result = subscription
         .channel_id
