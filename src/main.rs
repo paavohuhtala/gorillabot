@@ -72,13 +72,10 @@ async fn follow_server(ctx: &Context, msg: &Message, mut args: Args) -> CommandR
 
     match server_hostname.to_socket_addrs() {
         Ok(mut server_hostnames) => {
-            match server_hostnames.next() {
-                Some(_) => {}
-                None => {
-                    log::warn!("Failed to resolve server address: {}", server_hostname);
-                    msg.reply(ctx, "Failed to resolve server address").await?;
-                    return CommandResult::Ok(());
-                }
+            if server_hostnames.next().is_none() {
+                log::warn!("Failed to resolve server address: {}", server_hostname);
+                msg.reply(ctx, "Failed to resolve server address").await?;
+                return CommandResult::Ok(());
             };
         }
         Err(_) => {
@@ -126,10 +123,10 @@ async fn unfollow_server(ctx: &Context, msg: &Message) -> CommandResult {
     CommandResult::Ok(())
 }
 
-fn get_server_status_setter<'a>(
+fn get_server_status_setter(
     info: Option<(Info, Vec<Player>)>,
-    address: &'a str,
-) -> impl FnOnce(&mut serenity::builder::CreateEmbed) -> &mut serenity::builder::CreateEmbed + 'a {
+    address: &str,
+) -> impl FnOnce(&mut serenity::builder::CreateEmbed) -> &mut serenity::builder::CreateEmbed + '_ {
     let now: DateTime<Local> = Local::now();
     let updated_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -141,7 +138,9 @@ fn get_server_status_setter<'a>(
                 .field("Map", info.map.clone(), false)
                 .field("Player count", info.players, false);
 
-            let embed = if players.len() > 0 {
+            let embed = if players.is_empty() {
+                embed
+            } else {
                 let players = players
                     .into_iter()
                     .map(|player| player.name)
@@ -149,8 +148,6 @@ fn get_server_status_setter<'a>(
                     .join(", ");
 
                 embed.field("Players", players, false)
-            } else {
-                embed
             };
 
             embed.field("Updated at", updated_at, false)

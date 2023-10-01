@@ -23,7 +23,7 @@ impl BotDb {
     }
 
     pub async fn migrate(&self) -> anyhow::Result<()> {
-        const INIT_SQL: &'static str = include_str!("./init.sql");
+        const INIT_SQL: &str = include_str!("./init.sql");
         let conn = self.conn().await;
         conn.execute_batch(INIT_SQL)
             .context("Failed to migrate database")?;
@@ -88,5 +88,5 @@ impl BotDb {
 }
 
 impl TypeMapKey for BotDb {
-    type Value = BotDb;
+    type Value = Self;
 }
